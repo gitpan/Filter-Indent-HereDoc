@@ -4,9 +4,15 @@ use strict;
 use warnings;
 use Filter::Simple;
 
-our $VERSION = '1.00';
+our $VERSION = '1.01';
+our %options = ();
 our @buffer;            # Temporary storage of current here document
 our @termstring;        # FIFO list of here document terminating strings
+
+sub import {
+  %options = ();
+  $options{$_}++ foreach (@_);
+}
 
 FILTER_ONLY
   executable => sub {
@@ -17,21 +23,44 @@ FILTER_ONLY
 sub process_line {
   my $line = shift;
   if (@termstring) {
-    # we are in a here document
+    # At this point we are in a here document, so all lines of code
+    # are buffered until the end of the heredoc is detected
     push @buffer,$line;
     
     # 2 scenarios - terminator is a blank line, or terminator contains non-
     # whitespace. If blank line, then look for same whitespace at start of
     # each line in buffer. Otherwise take the whitespace that precedes the
     # terminator and match this against each line in the buffer.
+    #
+    # By default, we accept terminator strings in the Perl6 RFC111 format,
+    # i.e. whitespace, ';', and comments following the terminator are
+    # allowed. The only exception is if the terminator is a blank line,
+    # in this case then only whitespace is allowed.
     
-    if ($line =~ m/^(\s*)$termstring[0]\s*$/) {
-      my $whitespace = $1;
+    my $termregex;
+    unless ($options{strict_terminators}) {
+      if ($termstring[0] =~ /\S/) {
+        $termregex = qr/^(\s*)($termstring[0])(\s*;{0,1}\s*(?:#.*){0,1})$/;
+      } else {
+        $termregex = qr/^\s*$/;
+      }
+    } else {
+      if ($termstring[0] =~ /\S/) {
+        $termregex = qr/^(\s*)($termstring[0])$/;
+      } else {
+        $termregex = qr/^$/;
+      }
+    }
+    
+    my ($whitespace,$terminator,$extras);
+    if ($line =~ $termregex) {
+      ($whitespace,$terminator,$extras) = ($1,$2,$3);
       if ($termstring[0] =~ /\S/) {
         foreach (@buffer) {
           return unless (/^$whitespace/);
         }      
       } else {
+        # Terminator string is a blank line
         undef $whitespace;
         foreach (@buffer) {
           if (/^(\s+)\S/) {
@@ -39,26 +68,44 @@ sub process_line {
           }
         }
       }
-      # End of heredoc - strip the required amount of whitespace and return
+      # End of heredoc - strip the required amount of whitespace
       map s/^$whitespace//,@buffer;
+      
+      # If we found extra characters after the terminator (Perl6 RFC111
+      # style), move them onto a new line to be compatible with Perl5
+      if ($extras) {
+        pop @buffer;
+        push @buffer,$terminator;
+        push @buffer,$extras;
+      }
+      
+      # Return captured heredoc back to Perl and reset the buffer
       $line   = join "\n",@buffer;
       @buffer = ();
       shift @termstring;
       return "$line\n";
     }
   } else {
+    # Perl6 RFC111 states that whitespace after the terminator
+    # should be ingored
+    unless ($options{strict_terminators}) {
+      $line =~ s/(?<!<)<<(?!<)\s+/<</g;
+    }
+
     # Can we find the start of any here documents?
     MATCH: while ($line =~ m/(?<!<)<<(?!<)/g) {
       if ($line =~ m/\G(\w+)/) {
         push @termstring,$1;
         next MATCH;
       }
-      if ($line =~ m/\G\s*(['"`])(.*?)(?<!\\)\1/) {
+
+      if ($line =~ m/\G(?:\s*(['"`]))(.*?)(?<!\\)\1/) {
         my ($quote,$string) = ($1,$2);
         $string =~ s/\\$quote/$quote/g;
         push @termstring,$string;
         next MATCH;
       }
+      
       # Use of bare << to mean <<"" is depreciated
       # ...but still works so the module needs to support it!
       push @termstring,'';
@@ -109,6 +156,40 @@ leftmost character of the document will be flush with the left margin, e.g.
    Hello,
   World!
 
+=head2 Changes to terminator strings
+
+In addition to allowing indented here documents, Filter::Indent::HereDoc
+also provides support for a more permissive style of terminator string,
+as specified in Perl6 RFC111. The changes are:
+
+=over 4
+
+=item *
+
+Whitespace is allowed between '<<' and an unquoted terminator string when
+the heredoc is defined
+
+=item *
+
+At the end of the heredoc, whitespace, a single semicolon, and comments are 
+all allowed after the terminator, however other code statements are not
+
+=back
+
+You can force the module to revert to the standard Perl5 style of
+terminator string by specifying 'strict_terminators' when the module
+is C<use>'d, e.g.
+
+ use Filter::Indent::HereDoc;
+ print << EOT
+ Hello, World!
+ EOT ;             # this will work
+ 
+ use Filter::Indent::HereDoc 'strict_terminators';
+ print << EOT
+ Hello, World!
+ EOT ;             # this will generate an error
+
 =head1 CAVEATS
 
 =over 4
@@ -140,11 +221,16 @@ portability reasons it is probably best to avoid this feature.
 
 =head1 SEE ALSO
 
-L<Filter::Simple>, L<http://perl.jonallen.info/modules>, L<perlfaq4>
+L<Filter::Simple>, L<http://perl.jonallen.info/modules>, L<perlfaq4>, 
+Perl6 RFC111
 
 =head1 AUTHOR
 
 Jon Allen, E<lt>jj@jonallen.infoE<gt>
+
+=head1 THANKS TO
+
+Michael Schwern for the suggestions about Perl6 RFC111
 
 =head1 COPYRIGHT AND LICENSE
 
